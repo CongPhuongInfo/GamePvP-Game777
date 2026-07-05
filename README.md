@@ -1,5 +1,9 @@
 # Game777
 
+<p align="center">
+  <img src="Game777-Logo.png" width="800">
+</p>
+
 Trò chơi máy xóc đĩa 777 (kiểu slot cổ điển) trên mạng LAN hoặc Online.
 Chuyển thể từ GamePvP-VongQuayRong, giữ nguyên kiến trúc mạng star-topology
 (NetworkHub.vb/NetworkPeer.vb) và luật "đặt cược chung 1 vòng quay", chỉ đổi
