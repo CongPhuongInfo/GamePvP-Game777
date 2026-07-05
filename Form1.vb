@@ -1,0 +1,1620 @@
+Option Strict On
+Option Explicit On
+
+Imports System.Drawing
+Imports System.Drawing.Drawing2D
+Imports System.Windows.Forms
+Imports System.Collections.Generic
+Imports System.Globalization
+Imports System.Text
+Imports System.IO
+Imports Microsoft.VisualBasic
+
+''' <summary>
+''' Game "777": toi da 4 nguoi choi (1 Host + 3 Client) cung dat cuoc tren
+''' 1 vong quay chung gom 12 bieu tuong may xoc dia (7, BAR, chuong, trai cay...) + o No Hu.
+''' Moi van: chon 1 bieu tuong + so diem cuoc, Host quay ngau nhien (co trong so), ai chon
+''' trung bieu tuong thi duoc CUOC x HeSoNhan diem, sai thi mat
+''' CUOC diem. Kien truc mang tai su dung nguyen NetworkHub.vb (Host) / NetworkPeer.vb (Client).
+''' </summary>
+Public Class Form1
+    Inherits Form
+
+    Private Const DEFAULT_PORT As Integer = 9050
+    Private Const BOARD_W As Integer = 560
+    Private Const BOARD_H As Integer = 340
+    Private Const CELL_RADIUS As Integer = 34
+    Private Const BETTING_SECONDS As Integer = 15
+
+    Private Enum RoundState
+        Idle
+        Betting
+        Spinning
+        ShowingResult
+    End Enum
+
+    ' ------------------- Mang -------------------
+    Private hub As NetworkHub          ' dung khi la Host
+    Private peer As NetworkPeer        ' dung khi la Client
+    Private isHost As Boolean = False
+    Private localSeat As Integer = -1  ' 0 = Host, 1..3 = Client
+    Private playerNames(3) As String
+    Private playerConnected(3) As Boolean
+
+    ' ------------------- Game -------------------
+    Private game As New Game777Game()
+    Private scoresBySeat As New Dictionary(Of Integer, Long)
+    Private state As RoundState = RoundState.Idle
+    Private secondsLeft As Integer = 0
+    Private countdownTimer As Timer
+    Private hintTimer As Timer
+
+    Private selectedSymbolIndex As Integer = -1     ' bieu tuong dang chon (chua khoa)
+    Private hasLockedThisRound As Boolean = False
+    Private lockedSymbolBySeat(3) As Integer        ' -1 = chua khoa
+    Private lockedAmountBySeat(3) As Long
+    Private lastResultIndex As Integer = -1
+    ' cache ket qua van gan nhat da broadcast (dung de dong bo cho nguoi vao phong giua van)
+    Private lastBroadcastResultEntries As String = Nothing
+
+    ' cho hoi hop: ket qua nhan duoc tu mang se bi "giu lai", chi cong bo sau khi
+    ' hieu ung quay tren MAY NAY chay xong (khong lo diem/thang-thua som).
+    Private spinAnimInProgress As Boolean = False
+    Private pendingResultIndex As Integer = -1
+    Private pendingResultEntries As String = Nothing
+
+    ' hieu ung quay
+    Private spinSequence As New List(Of Integer)
+    Private spinDelays As New List(Of Integer)
+    Private spinPos As Integer = 0
+    Private spinTimer As Timer
+    Private highlightIndex As Integer = -1
+    Private symbolCenters(Game777Game.TOTAL_SLOTS - 1) As PointF
+    Private boardRect As Rectangle
+
+    ' ------------------- Jackpot (o "No Hu") -------------------
+    Private currentJackpotPool As Long = Game777Game.JACKPOT_SEED
+    Private pnlJackpotBanner As Panel    ' banner rieng phia tren vong quay, khong con de len bieu tuong nua
+    Private jackpotSlotImage As Image    ' sprite rieng cho o "No Hu" tren vong quay (Assets\nohu.png), co the null
+    Private jackpotBurstImage As Image   ' sprite hieu ung "no hu" khi trung thuong (Assets\nohu_hieuung.png), co the null
+    Private jackpotCelebrateTimer As Timer
+    Private jackpotCelebrateFrame As Integer = 0
+    Private jackpotCelebrateActive As Boolean = False
+
+    ' ------------------- Nhat ky ket qua (bieu tuong da ra gan day) -------------------
+    Private Const HISTORY_MAX As Integer = 25    ' so van gan nhat duoc luu lai trong nhat ky
+    Private spinHistory As New List(Of Integer)  ' phan tu 0 = van gan nhat nhat, cang ve sau cang cu
+    Private pnlHistory As Panel
+
+    ' ------------------- Anh sprite (Assets\*.png), co the null neu thieu file -------------------
+    Private symbolImages(Game777Game.SYMBOL_COUNT - 1) As Image
+    Private logoImage As Image
+
+    ' ------------------- UI: Connect panel -------------------
+    Private pnlConnect As Panel
+    Private txtName As TextBox
+    Private txtIP As TextBox
+    Private txtPort As TextBox
+    Private btnHost As Button
+    Private btnJoin As Button
+    Private lblConnectStatus As Label
+
+    ' ------------------- UI: Game panel -------------------
+    Private pnlGame As Panel
+    Private boardPanel As Panel
+    Private lblRoundInfo As Label
+    Private lblCountdown As Label
+    Private nudBet As NumericUpDown
+    Private btnLockBet As Button
+    Private btnHostAction As Button
+    Private pnlPlayers(3) As Panel
+    Private lblCardStatus(3) As Label
+    Private lblCardStats(3) As Label
+    Private lblCardResult(3) As Label
+    Private lastRoundHasResult(3) As Boolean
+    Private lastRoundWonBySeat(3) As Boolean
+    Private lastRoundPayoutBySeat(3) As Long
+
+    ' ------------------- UI: Chat panel -------------------
+    Private pnlChat As Panel
+    Private lstChat As ListBox
+    Private txtChatInput As TextBox
+    Private btnSend As Button
+
+    Public Sub New()
+        Me.Text = "Game 777"
+        Me.ClientSize = New Size(940, 700)
+        Me.StartPosition = FormStartPosition.CenterScreen
+        Dim i As Integer
+        For i = 0 To 3
+            playerNames(i) = "Người chơi " & (i + 1).ToString()
+            playerConnected(i) = False
+            scoresBySeat(i) = Game777Game.STARTING_SCORE
+            lockedSymbolBySeat(i) = -1
+        Next i
+        BuildConnectPanel()
+        LoadSprites()
+    End Sub
+
+    ''' <summary>Nap anh tu thu muc "Assets" (dat canh file .exe). Neu thieu file hoac loi doc anh,
+    ''' bieu tuong/logo 777 tuong ung se tu dong ve lai bang hinh tron mau (fallback), khong bi crash.</summary>
+    Private Sub LoadSprites()
+        Dim assetsDir As String = Path.Combine(Application.StartupPath, "Assets")
+        Dim i As Integer
+        For i = 0 To Game777Game.SYMBOL_COUNT - 1
+            Dim fileName As String = Game777Game.Symbols(i).ImageFile
+            symbolImages(i) = Nothing
+            If fileName IsNot Nothing AndAlso fileName <> "" Then
+                Dim fullPath As String = Path.Combine(assetsDir, fileName)
+                Try
+                    If File.Exists(fullPath) Then
+                        symbolImages(i) = Image.FromFile(fullPath)
+                    End If
+                Catch
+                    symbolImages(i) = Nothing ' anh loi/hong -> dung fallback ve tay
+                End Try
+            End If
+        Next i
+
+        Try
+            Dim logoPath As String = Path.Combine(assetsDir, "Logo777.png")
+            If File.Exists(logoPath) Then
+                logoImage = Image.FromFile(logoPath)
+            End If
+        Catch
+            logoImage = Nothing
+        End Try
+
+        ' Sprite rieng cho o "No Hu" (vd: hu vang/ket bao lo). Neu khong co file, fallback ve tay (hinh tron do + chu "HU").
+        Try
+            Dim jackpotSlotPath As String = Path.Combine(assetsDir, "nohu.png")
+            If File.Exists(jackpotSlotPath) Then
+                jackpotSlotImage = Image.FromFile(jackpotSlotPath)
+            End If
+        Catch
+            jackpotSlotImage = Nothing
+        End Try
+
+        ' Sprite hieu ung "no hu" (vd: phao hoa/anh sang toa ra) hien tam thoi khi vong quay dung vao o No Hu.
+        ' Neu khong co file, fallback tu ve tia sang toa tron bang GDI+.
+        Try
+            Dim jackpotBurstPath As String = Path.Combine(assetsDir, "nohu_hieuung.png")
+            If File.Exists(jackpotBurstPath) Then
+                jackpotBurstImage = Image.FromFile(jackpotBurstPath)
+            End If
+        Catch
+            jackpotBurstImage = Nothing
+        End Try
+    End Sub
+
+    ' ============================================================
+    '  MAU / TEN THEO SEAT
+    ' ============================================================
+    Private Function PlayerColor(seat As Integer) As Color
+        Select Case seat
+            Case 0 : Return Color.FromArgb(200, 40, 40)
+            Case 1 : Return Color.FromArgb(30, 110, 200)
+            Case 2 : Return Color.FromArgb(30, 150, 70)
+            Case Else : Return Color.FromArgb(160, 90, 190)
+        End Select
+    End Function
+
+    ' ============================================================
+    '  CONNECT PANEL (chon Host hoac Join)
+    ' ============================================================
+    Private Sub BuildConnectPanel()
+        pnlConnect = New Panel()
+        pnlConnect.Dock = DockStyle.Fill
+        pnlConnect.BackColor = Color.FromArgb(245, 245, 240)
+
+        Dim lblTitle As New Label()
+        lblTitle.Text = "GAME 777"
+        lblTitle.Font = New Font("Segoe UI", 18.0!, FontStyle.Bold)
+        lblTitle.AutoSize = True
+        lblTitle.Location = New Point(40, 30)
+        pnlConnect.Controls.Add(lblTitle)
+
+        Dim lblName As New Label() : lblName.Text = "Tên của bạn:" : lblName.AutoSize = True
+        lblName.Location = New Point(40, 100)
+        pnlConnect.Controls.Add(lblName)
+        txtName = New TextBox() : txtName.Location = New Point(40, 122) : txtName.Size = New Size(220, 24)
+        txtName.Text = "Người chơi"
+        pnlConnect.Controls.Add(txtName)
+
+        Dim lblPort As New Label() : lblPort.Text = "Cổng (Port):" : lblPort.AutoSize = True
+        lblPort.Location = New Point(40, 160)
+        pnlConnect.Controls.Add(lblPort)
+        txtPort = New TextBox() : txtPort.Location = New Point(40, 182) : txtPort.Size = New Size(220, 24)
+        txtPort.Text = DEFAULT_PORT.ToString()
+        pnlConnect.Controls.Add(txtPort)
+
+        btnHost = New Button() : btnHost.Text = "Tạo phòng (Host)"
+        btnHost.Location = New Point(40, 220) : btnHost.Size = New Size(220, 34)
+        AddHandler btnHost.Click, AddressOf BtnHost_Click
+        pnlConnect.Controls.Add(btnHost)
+
+        Dim lblIP As New Label() : lblIP.Text = "IP của Host:" : lblIP.AutoSize = True
+        lblIP.Location = New Point(40, 280)
+        pnlConnect.Controls.Add(lblIP)
+        txtIP = New TextBox() : txtIP.Location = New Point(40, 302) : txtIP.Size = New Size(220, 24)
+        txtIP.Text = "127.0.0.1"
+        pnlConnect.Controls.Add(txtIP)
+
+        btnJoin = New Button() : btnJoin.Text = "Vào phòng (Join)"
+        btnJoin.Location = New Point(40, 336) : btnJoin.Size = New Size(220, 34)
+        AddHandler btnJoin.Click, AddressOf BtnJoin_Click
+        pnlConnect.Controls.Add(btnJoin)
+
+        lblConnectStatus = New Label()
+        lblConnectStatus.Location = New Point(40, 390) : lblConnectStatus.Size = New Size(400, 60)
+        lblConnectStatus.ForeColor = Color.DimGray
+        pnlConnect.Controls.Add(lblConnectStatus)
+
+        Me.Controls.Add(pnlConnect)
+    End Sub
+
+    Private Sub BtnHost_Click(sender As Object, e As EventArgs)
+        Dim port As Integer
+        If Not Integer.TryParse(txtPort.Text.Trim(), port) Then
+            MessageBox.Show("Port không hợp lệ.") : Return
+        End If
+        isHost = True
+        localSeat = 0
+        playerNames(0) = SafeName(txtName.Text)
+        playerConnected(0) = True
+
+        hub = New NetworkHub(Me)
+        AddHandler hub.ClientConnected, AddressOf Hub_ClientConnected
+        AddHandler hub.ClientDisconnected, AddressOf Hub_ClientDisconnected
+        AddHandler hub.LineReceivedFromClient, AddressOf Hub_LineReceived
+        hub.StartListening(port)
+
+        lblConnectStatus.Text = "Đang chờ người chơi kết nối trên cổng " & port.ToString() & " ..."
+        ShowGamePanel()
+    End Sub
+
+    Private Sub BtnJoin_Click(sender As Object, e As EventArgs)
+        Dim port As Integer
+        If Not Integer.TryParse(txtPort.Text.Trim(), port) Then
+            MessageBox.Show("Port không hợp lệ.") : Return
+        End If
+        isHost = False
+        playerNames(0) = SafeName(txtName.Text) ' se duoc ghi de dung seat sau khi WELCOME
+
+        peer = New NetworkPeer(Me)
+        AddHandler peer.Connected, AddressOf Peer_Connected
+        AddHandler peer.Disconnected, AddressOf Peer_Disconnected
+        AddHandler peer.LineReceived, AddressOf Peer_LineReceived
+        peer.ConnectToHost(txtIP.Text.Trim(), port)
+
+        lblConnectStatus.Text = "Đang kết nối đến " & txtIP.Text.Trim() & ":" & port.ToString() & " ..."
+    End Sub
+
+    Private Function SafeName(raw As String) As String
+        Dim s As String = raw.Trim()
+        If s = "" Then Return "Người chơi"
+        If s.Length > 16 Then s = s.Substring(0, 16)
+        Return s
+    End Function
+
+    ' ============================================================
+    '  SU KIEN MANG - PHIA CLIENT (NetworkPeer)
+    ' ============================================================
+    Private Sub Peer_Connected()
+        peer.SendLine("G777_HELLO:" & playerNames(0))
+    End Sub
+
+    Private Sub Peer_Disconnected()
+        AppendChat("[Hệ thống] Mất kết nối tới Host.")
+    End Sub
+
+    Private Sub Peer_LineReceived(line As String)
+        HandleProtocolLine(line, -1)
+    End Sub
+
+    ' ============================================================
+    '  SU KIEN MANG - PHIA HOST (NetworkHub)
+    ' ============================================================
+    Private Sub Hub_ClientConnected(seatIndex As Integer)
+        playerConnected(seatIndex) = True
+        hub.SendToClient(seatIndex, "G777_WELCOME:" & seatIndex.ToString())
+        BroadcastNames()
+        BroadcastScores()
+        BroadcastConnected()
+        hub.SendToClient(seatIndex, "G777_JACKPOT:" & game.JackpotPool.ToString())
+        If spinHistory.Count > 0 Then
+            hub.SendToClient(seatIndex, "G777_HISTORY:" & String.Join(",", spinHistory))
+        End If
+        SyncStateToLateJoiner(seatIndex)
+        RefreshPlayerCards()
+        AppendChat("[Hệ thống] Player " & (seatIndex + 1).ToString() & " đã vào phòng.")
+    End Sub
+
+    ''' <summary>Neu co nguoi vao phong khi van dau da bat dau roi (Betting/Spinning/ShowingResult),
+    ''' gui rieng cho seat do du du lieu de man hinh khong bi ket o "Cho Host bat dau van moi".
+    ''' Voi Spinning/ShowingResult, nguoi vao sau se thay ngay ket qua (bo qua hieu ung quay da troi qua),
+    ''' vi ho khong co mat luc quay nen khong can hoi hop.</summary>
+    Private Sub SyncStateToLateJoiner(seatIndex As Integer)
+        If state = RoundState.Idle Then Return
+
+        hub.SendToClient(seatIndex, "G777_ROUND:" & game.CurrentRoundNo.ToString() & "|" & Math.Max(0, secondsLeft).ToString())
+
+        Dim s As Integer
+        For s = 0 To 3
+            If lockedSymbolBySeat(s) >= 0 Then
+                hub.SendToClient(seatIndex, "G777_LOCK:" & s.ToString() & "|" & lockedSymbolBySeat(s).ToString() & "|" & lockedAmountBySeat(s).ToString())
+            End If
+        Next s
+
+        If (state = RoundState.Spinning OrElse state = RoundState.ShowingResult) AndAlso lastBroadcastResultEntries IsNot Nothing Then
+            hub.SendToClient(seatIndex, "G777_RESULT:" & lastResultIndex.ToString() & ":" & lastBroadcastResultEntries)
+        End If
+    End Sub
+
+    Private Sub Hub_ClientDisconnected(seatIndex As Integer)
+        playerConnected(seatIndex) = False
+        playerNames(seatIndex) = "Người chơi " & (seatIndex + 1).ToString()
+        BroadcastNames()
+        BroadcastConnected()
+        RefreshPlayerCards()
+        AppendChat("[Hệ thống] Player " & (seatIndex + 1).ToString() & " đã rời phòng.")
+    End Sub
+
+    Private Sub Hub_LineReceived(seatIndex As Integer, line As String)
+        HandleProtocolLine(line, seatIndex)
+    End Sub
+
+    ' ============================================================
+    '  XU LY GIAO THUC CHUNG
+    '  fromSeat = -1 khi day la Client dang nhan tin tu Host (khong can biet seat nguoi gui)
+    '  fromSeat = 0..3 khi day la Host dang nhan tin tu 1 Client cu the (seat do)
+    ' ============================================================
+    Private Sub HandleProtocolLine(line As String, fromSeat As Integer)
+        If line Is Nothing OrElse line = "" Then Return
+        Dim idx As Integer = line.IndexOf(":"c)
+        Dim msgType As String = If(idx >= 0, line.Substring(0, idx), line)
+        Dim payload As String = If(idx >= 0, line.Substring(idx + 1), "")
+
+        Select Case msgType
+            Case "CHAT"
+                Dim p2 As Integer = payload.IndexOf(":"c)
+                If p2 >= 0 Then
+                    AppendChat(payload.Substring(0, p2) & ": " & payload.Substring(p2 + 1))
+                End If
+                If isHost Then hub.BroadcastExcept("CHAT:" & payload, fromSeat)
+
+            Case "G777_WELCOME"
+                localSeat = Integer.Parse(payload, CultureInfo.InvariantCulture)
+                ShowGamePanel()
+                lblConnectStatus.Text = "Đã vào phòng, bạn là Player " & (localSeat + 1).ToString()
+
+            Case "G777_HELLO"
+                If fromSeat >= 0 Then
+                    playerNames(fromSeat) = SafeName(payload)
+                    BroadcastNames()
+                    RefreshPlayerCards()
+                End If
+
+            Case "G777_NAMES"
+                Dim parts As String() = payload.Split("|"c)
+                Dim i As Integer
+                For i = 0 To Math.Min(3, parts.Length - 1)
+                    If parts(i) <> "" Then playerNames(i) = parts(i)
+                Next i
+                RefreshPlayerCards()
+
+            Case "G777_SCORES"
+                Dim sp As String() = payload.Split("|"c)
+                Dim i2 As Integer
+                For i2 = 0 To Math.Min(3, sp.Length - 1)
+                    Dim v As Long
+                    If Long.TryParse(sp(i2), NumberStyles.Integer, CultureInfo.InvariantCulture, v) Then
+                        scoresBySeat(i2) = v
+                    End If
+                Next i2
+                RefreshPlayerCards()
+
+            Case "G777_CONN"
+                Dim cp As String() = payload.Split("|"c)
+                Dim i3 As Integer
+                For i3 = 0 To Math.Min(3, cp.Length - 1)
+                    playerConnected(i3) = (cp(i3).Trim() = "1")
+                Next i3
+                RefreshPlayerCards()
+
+            Case "G777_ROUND"
+                Dim rp As String() = payload.Split("|"c)
+                Dim roundNo As Integer = Integer.Parse(rp(0), CultureInfo.InvariantCulture)
+                Dim secs As Integer = Integer.Parse(rp(1), CultureInfo.InvariantCulture)
+                BeginBettingLocal(roundNo, secs)
+
+            Case "G777_LOCK"
+                Dim lp As String() = payload.Split("|"c)
+                Dim seat As Integer = Integer.Parse(lp(0), CultureInfo.InvariantCulture)
+                Dim animal As Integer = Integer.Parse(lp(1), CultureInfo.InvariantCulture)
+                Dim amount As Long = Long.Parse(lp(2), CultureInfo.InvariantCulture)
+                lockedSymbolBySeat(seat) = animal
+                lockedAmountBySeat(seat) = amount
+                RefreshPlayerCards()
+
+            Case "G777_BET"
+                If fromSeat >= 0 AndAlso isHost Then
+                    Dim bp As String() = payload.Split("|"c)
+                    Dim animal As Integer = Integer.Parse(bp(0), CultureInfo.InvariantCulture)
+                    Dim amount As Long = Long.Parse(bp(1), CultureInfo.InvariantCulture)
+                    ProcessBetFromSeat(fromSeat, animal, amount)
+                End If
+
+            Case "G777_BET_NACK"
+                UnlockLocalBetUI()
+
+            Case "G777_SPIN"
+                Dim resultIndex As Integer = Integer.Parse(payload, CultureInfo.InvariantCulture)
+                StartSpinAnimation(resultIndex)
+
+            Case "G777_RESULT"
+                Dim colonIdx As Integer = payload.IndexOf(":"c)
+                Dim resIndex As Integer = Integer.Parse(payload.Substring(0, colonIdx), CultureInfo.InvariantCulture)
+                Dim entriesRaw As String = payload.Substring(colonIdx + 1)
+                QueueOrApplyResult(resIndex, entriesRaw)
+
+            Case "G777_JACKPOT"
+                currentJackpotPool = Long.Parse(payload, CultureInfo.InvariantCulture)
+                UpdateJackpotLabel()
+
+            Case "G777_HISTORY"
+                spinHistory.Clear()
+                If payload.Trim() <> "" Then
+                    Dim hp As String() = payload.Split(","c)
+                    Dim hv As String
+                    For Each hv In hp
+                        Dim n As Integer
+                        If Integer.TryParse(hv, NumberStyles.Integer, CultureInfo.InvariantCulture, n) Then
+                            spinHistory.Add(n)
+                        End If
+                    Next hv
+                End If
+                RefreshHistoryPanel()
+        End Select
+    End Sub
+
+    ' ============================================================
+    '  GUI DU LIEU (Host broadcast trang thai dung cho ca Host lan Client)
+    ' ============================================================
+    Private Sub BroadcastNames()
+        If Not isHost Then Return
+        Dim s As String = playerNames(0) & "|" & playerNames(1) & "|" & playerNames(2) & "|" & playerNames(3)
+        hub.Broadcast("G777_NAMES:" & s)
+    End Sub
+
+    Private Sub BroadcastScores()
+        If Not isHost Then Return
+        Dim s As String = scoresBySeat(0).ToString() & "|" & scoresBySeat(1).ToString() & "|" &
+                           scoresBySeat(2).ToString() & "|" & scoresBySeat(3).ToString()
+        hub.Broadcast("G777_SCORES:" & s)
+    End Sub
+
+    ''' <summary>Chi Host goi: dong bo trang thai da-ket-noi cua tung seat sang tat ca Client.
+    ''' Neu khong co ham nay, Client se khong biet duoc seat nao (ke ca seat cua chinh minh)
+    ''' dang co nguoi, khien the nguoi choi hien "(trong)" du da vao phong.</summary>
+    Private Sub BroadcastConnected()
+        If Not isHost Then Return
+        Dim s As String = CInt(IIf(playerConnected(0), 1, 0)).ToString() & "|" &
+                           CInt(IIf(playerConnected(1), 1, 0)).ToString() & "|" &
+                           CInt(IIf(playerConnected(2), 1, 0)).ToString() & "|" &
+                           CInt(IIf(playerConnected(3), 1, 0)).ToString()
+        hub.Broadcast("G777_CONN:" & s)
+    End Sub
+
+    ' ============================================================
+    '  VONG DAT CUOC (Host dieu khien state machine)
+    ' ============================================================
+    Private Sub BtnHostAction_Click(sender As Object, e As EventArgs)
+        If Not isHost Then Return
+        Select Case state
+            Case RoundState.Idle, RoundState.ShowingResult
+                game.StartNewRound()
+                lastBroadcastResultEntries = Nothing
+                Dim i As Integer
+                For i = 0 To 3
+                    lockedSymbolBySeat(i) = -1
+                Next i
+                hub.Broadcast("G777_ROUND:" & game.CurrentRoundNo.ToString() & "|" & BETTING_SECONDS.ToString())
+                BeginBettingLocal(game.CurrentRoundNo, BETTING_SECONDS)
+
+            Case RoundState.Betting
+                DoSpinNow()
+
+            Case RoundState.Spinning
+                ' dang quay, khong lam gi
+
+        End Select
+    End Sub
+
+    Private Sub BeginBettingLocal(roundNo As Integer, secs As Integer)
+        state = RoundState.Betting
+        boardPanel.Cursor = Cursors.Hand
+        selectedSymbolIndex = -1
+        hasLockedThisRound = False
+        Dim i As Integer
+        For i = 0 To 3
+            lockedSymbolBySeat(i) = -1
+            lastRoundHasResult(i) = False
+            If pnlPlayers(i) IsNot Nothing Then pnlPlayers(i).BackColor = Color.White
+            If lblCardResult(i) IsNot Nothing Then lblCardResult(i).Text = ""
+        Next i
+        secondsLeft = secs
+        lblRoundInfo.Text = "Ván " & roundNo.ToString() & " -  hãy chọn 1 biểu tượng và khoá cược!"
+        lblCountdown.Text = "Còn: " & secondsLeft.ToString() & "s"
+        btnLockBet.Enabled = True
+        nudBet.Enabled = True
+        If isHost Then
+            btnHostAction.Text = "Quay ngay"
+            btnHostAction.Enabled = True
+        Else
+            btnHostAction.Visible = False
+        End If
+        ' Dem nguoc chay tren CA Host lan Client, de thanh dem giay khong bi dung im
+        ' ben man hinh Client cho toi khi Host quay xong.
+        If countdownTimer Is Nothing Then
+            countdownTimer = New Timer()
+            countdownTimer.Interval = 1000
+            AddHandler countdownTimer.Tick, AddressOf CountdownTimer_Tick
+        End If
+        countdownTimer.Start()
+        boardPanel.Invalidate()
+        RefreshPlayerCards()
+    End Sub
+
+    Private Sub CountdownTimer_Tick(sender As Object, e As EventArgs)
+        secondsLeft -= 1
+        lblCountdown.Text = "Còn: " & Math.Max(0, secondsLeft).ToString() & "s"
+        If secondsLeft <= 0 Then
+            countdownTimer.Stop()
+            DoSpinNow()
+        End If
+    End Sub
+
+    ''' <summary>Chi Host goi: chot van dat cuoc, quay va broadcast ket qua.</summary>
+    Private Sub DoSpinNow()
+        If Not isHost Then Return
+        If countdownTimer IsNot Nothing Then countdownTimer.Stop()
+        state = RoundState.Spinning
+        boardPanel.Cursor = Cursors.Default
+        btnHostAction.Enabled = False
+        btnLockBet.Enabled = False
+
+        Dim resultIndex As Integer = game.SpinResult()
+        lastResultIndex = resultIndex
+        hub.Broadcast("G777_SPIN:" & resultIndex.ToString())
+        StartSpinAnimation(resultIndex) ' Host tu quay hinh anh cua minh luon
+
+        Dim outcomes As List(Of Game777Game.RoundOutcome) = game.ComputePayouts(resultIndex, scoresBySeat)
+        Dim sb As New StringBuilder()
+        sb.Append(resultIndex.ToString()).Append(":")
+        Dim first As Boolean = True
+        For Each o As Game777Game.RoundOutcome In outcomes
+            If Not first Then sb.Append(";")
+            first = False
+            sb.Append(o.Seat.ToString()).Append(",").Append(o.SymbolIndex.ToString()).Append(",")
+            sb.Append(o.Amount.ToString()).Append(",").Append(If(o.Won, "1", "0")).Append(",")
+            sb.Append(o.Payout.ToString()).Append(",").Append(o.NewScore.ToString())
+        Next o
+        hub.Broadcast("G777_RESULT:" & sb.ToString())
+
+        currentJackpotPool = game.JackpotPool
+        UpdateJackpotLabel()
+        hub.Broadcast("G777_JACKPOT:" & game.JackpotPool.ToString())
+
+        ' Host cung tu "nhan" ket qua cua chinh minh giong nhu Client, de bi giu lai
+        ' cho toi khi vong quay tren man hinh Host dung han (xem QueueOrApplyResult).
+        Dim entriesForHost As String = sb.ToString().Substring(sb.ToString().IndexOf(":"c) + 1)
+        lastBroadcastResultEntries = entriesForHost
+        QueueOrApplyResult(resultIndex, entriesForHost)
+    End Sub
+
+    ''' <summary>Host xu ly 1 cuoc gui len tu Client (hoac tu chinh Host qua LockBet local).
+    ''' Neu cuoc khong hop le (het gio, da cuoc roi, du lieu sai), bao NACK ve dung seat do
+    ''' de UI cua ho duoc mo khoa lai thay vi ket cung.</summary>
+    Private Sub ProcessBetFromSeat(seat As Integer, symbolIndex As Integer, amount As Long)
+        If state <> RoundState.Betting Then
+            RejectBet(seat)
+            Return
+        End If
+        If game.HasBet(seat) Then
+            RejectBet(seat)
+            Return
+        End If
+        Dim currentScore As Long = 0L
+        If scoresBySeat.ContainsKey(seat) Then currentScore = scoresBySeat(seat)
+        If Not game.PlaceBet(seat, symbolIndex, amount, currentScore) Then
+            RejectBet(seat)
+            Return
+        End If
+        lockedSymbolBySeat(seat) = symbolIndex
+        lockedAmountBySeat(seat) = amount
+        hub.Broadcast("G777_LOCK:" & seat.ToString() & "|" & symbolIndex.ToString() & "|" & amount.ToString())
+        RefreshPlayerCards()
+    End Sub
+
+    ''' <summary>Bao cho 1 seat biet cuoc vua gui bi tu choi, de ho mo khoa UI dat cuoc lai.</summary>
+    Private Sub RejectBet(seat As Integer)
+        If seat = 0 Then
+            UnlockLocalBetUI()
+        Else
+            hub.SendToClient(seat, "G777_BET_NACK:")
+        End If
+    End Sub
+
+    ''' <summary>Mo lai nut Khoa cuoc tren may nay sau khi cuoc bi Host tu choi (dung cho ca Host va Client).</summary>
+    Private Sub UnlockLocalBetUI()
+        hasLockedThisRound = False
+        If state = RoundState.Betting Then
+            btnLockBet.Enabled = True
+            nudBet.Enabled = True
+        End If
+        AppendChat("[Hệ thống] Cược vừa rồi không hợp lệ, hãy đặt cược lại.")
+    End Sub
+
+    Private Sub BtnLockBet_Click(sender As Object, e As EventArgs)
+        If state <> RoundState.Betting Then Return
+        If hasLockedThisRound Then Return
+        If selectedSymbolIndex < 0 Then
+            MessageBox.Show("Hãy bấm chọn 1 biểu tượng trên vòng quay trước.")
+            Return
+        End If
+        Dim amount As Long = CLng(nudBet.Value)
+        Dim mySeat As Integer = If(isHost, 0, localSeat)
+        If mySeat >= 0 AndAlso amount > scoresBySeat(mySeat) Then
+            MessageBox.Show("Bạn không đủ điểm để đặt mức này.")
+            Return
+        End If
+        hasLockedThisRound = True
+        btnLockBet.Enabled = False
+        nudBet.Enabled = False
+
+        If isHost Then
+            ProcessBetFromSeat(0, selectedSymbolIndex, amount)
+        Else
+            If peer IsNot Nothing AndAlso peer.IsConnected Then
+                peer.SendLine("G777_BET:" & selectedSymbolIndex.ToString() & "|" & amount.ToString())
+            End If
+        End If
+    End Sub
+
+    ' ============================================================
+    '  KET QUA
+    ' ============================================================
+    Private Sub ApplyResult(resultIndex As Integer, entriesRaw As String)
+        lastResultIndex = resultIndex
+        state = RoundState.ShowingResult
+        AddHistoryEntry(resultIndex)
+        If resultIndex = Game777Game.JACKPOT_INDEX Then
+            lblRoundInfo.Text = "Kết quả: Nổ Hũ!!! (ô đặc biệt)"
+            AppendChat("[Hệ thống] Vô hũ!!! Vòng quay đã dừng ở ô Nổ Hũ.")
+            StartJackpotCelebration()
+        Else
+            lblRoundInfo.Text = "Kết quả: " & Game777Game.Symbols(resultIndex).Name &
+                                 " (x" & Game777Game.Symbols(resultIndex).Multiplier.ToString() & ")"
+        End If
+
+        If entriesRaw.Trim() <> "" Then
+            Dim entries As String() = entriesRaw.Split(";"c)
+            Dim en As String
+            For Each en In entries
+                If en.Trim() = "" Then Continue For
+                Dim f As String() = en.Split(","c)
+                Dim seat As Integer = Integer.Parse(f(0), CultureInfo.InvariantCulture)
+                Dim animal As Integer = Integer.Parse(f(1), CultureInfo.InvariantCulture)
+                Dim amount As Long = Long.Parse(f(2), CultureInfo.InvariantCulture)
+                Dim won As Boolean = (f(3) = "1")
+                Dim payout As Long = Long.Parse(f(4), CultureInfo.InvariantCulture)
+                Dim newScore As Long = Long.Parse(f(5), CultureInfo.InvariantCulture)
+                scoresBySeat(seat) = newScore
+
+                Dim animalName As String
+                If animal = Game777Game.JACKPOT_INDEX Then
+                    animalName = "Nổ Hũ"
+                Else
+                    animalName = Game777Game.Symbols(animal).Name
+                End If
+
+                Dim tag As String = "Player " & (seat + 1).ToString()
+                lastRoundHasResult(seat) = True
+                lastRoundWonBySeat(seat) = won
+                lastRoundPayoutBySeat(seat) = payout
+                If won AndAlso animal = Game777Game.JACKPOT_INDEX Then
+                    AppendChat("[Kết quả] " & tag & " Trúng Nổ Hũ, nhận " & payout.ToString() & " điểm!")
+                ElseIf won Then
+                    AppendChat("[Kết quả] " & tag & " thắng " & payout.ToString() & " điểm (cược " &
+                               animalName & " x" & amount.ToString() & ").")
+                Else
+                    AppendChat("[Kết quả] " & tag & " thua " & Math.Abs(payout).ToString() & " điểm.")
+                End If
+            Next en
+        End If
+
+        If isHost Then
+            btnHostAction.Text = "Ván mới"
+            btnHostAction.Enabled = True
+        End If
+        RefreshPlayerCards()
+    End Sub
+
+    ' ============================================================
+    '  HIEU UNG QUAY (dung chung cho ca Host va Client, chi ve hinh)
+    ' ============================================================
+    Private Sub StartSpinAnimation(targetIndex As Integer)
+        state = RoundState.Spinning
+        boardPanel.Cursor = Cursors.Default
+        spinAnimInProgress = True
+        pendingResultIndex = -1
+        pendingResultEntries = Nothing
+        If isHost Then
+            btnHostAction.Enabled = False
+        End If
+        btnLockBet.Enabled = False
+        lblRoundInfo.Text = "Đang quay..."
+        lblCountdown.Text = ""
+
+        BuildSpinSequence(targetIndex)
+        spinPos = 0
+        If spinTimer Is Nothing Then
+            spinTimer = New Timer()
+            AddHandler spinTimer.Tick, AddressOf SpinTimer_Tick
+        End If
+        spinTimer.Interval = spinDelays(0)
+        spinTimer.Start()
+    End Sub
+
+    ''' <summary>Tao chuoi buoc nhay qua tung bieu tuong: quay nhanh nhieu vong roi cham dan
+    ''' va dung dung tai targetIndex (giong hieu ung den chay cua may xu / vong quay thuong).</summary>
+    Private Sub BuildSpinSequence(targetIndex As Integer)
+        spinSequence.Clear()
+        spinDelays.Clear()
+        Const laps As Integer = 3
+        Dim n As Integer = Game777Game.TOTAL_SLOTS ' 13 o (12 bieu tuong + No Hu)
+        Dim totalSteps As Integer = laps * n + targetIndex + 1
+        Dim i As Integer
+        For i = 0 To totalSteps - 1
+            spinSequence.Add(i Mod n)
+        Next i
+        Dim total As Integer = spinSequence.Count
+        For i = 0 To total - 1
+            Dim remain As Integer = total - i
+            Dim d As Integer
+            If remain > n Then
+                d = 40
+            Else
+                Dim frac As Double = (n - remain) / CDbl(n)
+                d = 40 + CInt(240.0 * frac)
+            End If
+            spinDelays.Add(d)
+        Next i
+    End Sub
+
+    Private Sub SpinTimer_Tick(sender As Object, e As EventArgs)
+        highlightIndex = spinSequence(spinPos)
+        boardPanel.Invalidate()
+        spinPos += 1
+        If spinPos >= spinSequence.Count Then
+            spinTimer.Stop()
+            OnSpinAnimationFinished()
+        Else
+            spinTimer.Interval = spinDelays(spinPos)
+        End If
+    End Sub
+
+    Private Sub OnSpinAnimationFinished()
+        boardPanel.Invalidate()
+        spinAnimInProgress = False
+        If pendingResultIndex >= 0 Then
+            Dim r As Integer = pendingResultIndex
+            Dim ent As String = pendingResultEntries
+            pendingResultIndex = -1
+            pendingResultEntries = Nothing
+            ApplyResult(r, ent)
+        End If
+        ' Neu ket qua tu mang chua toi kip (hiem, do do tre mang), cu giu nguyen man
+        ' hinh "Dang quay..." va cho G777_RESULT den, luc do QueueOrApplyResult se tu
+        ' goi ApplyResult ngay vi spinAnimInProgress da False.
+    End Sub
+
+    ''' <summary>Nhan ket qua tu mang (hoac tu chinh Host): neu vong quay tren man hinh
+    ''' nay dang chay thi giu lai, cho quay xong moi cong bo - de tao cam giac hoi hop.</summary>
+    Private Sub QueueOrApplyResult(resultIndex As Integer, entries As String)
+        If spinAnimInProgress Then
+            pendingResultIndex = resultIndex
+            pendingResultEntries = entries
+        Else
+            ApplyResult(resultIndex, entries)
+        End If
+    End Sub
+
+    ' ============================================================
+    '  GAME PANEL (Board + dieu khien dat cuoc + the nguoi choi)
+    ' ============================================================
+    Private Sub ShowGamePanel()
+        If pnlGame IsNot Nothing Then Return ' da dung
+        pnlConnect.Visible = False
+
+        pnlGame = New Panel()
+        pnlGame.Dock = DockStyle.Fill
+        pnlGame.BackColor = Color.FromArgb(20, 24, 30)
+
+        ' Banner Quy Jackpot rieng, nam TREN vong quay (khong con de de len hang bieu tuong dau tien nua)
+        Const BANNER_H As Integer = 40
+        Const BANNER_GAP As Integer = 8
+        Dim boardTopY As Integer = 20 + BANNER_H + BANNER_GAP
+
+        pnlJackpotBanner = New Panel()
+        pnlJackpotBanner.Location = New Point(20, 20)
+        pnlJackpotBanner.Size = New Size(BOARD_W, BANNER_H)
+        pnlJackpotBanner.BackColor = Color.FromArgb(20, 24, 30)
+        AddHandler pnlJackpotBanner.Paint, AddressOf JackpotBanner_Paint
+        pnlGame.Controls.Add(pnlJackpotBanner)
+
+        boardPanel = New Panel()
+        boardPanel.Location = New Point(20, boardTopY)
+        boardPanel.Size = New Size(BOARD_W, BOARD_H)
+        boardPanel.BackColor = Color.FromArgb(10, 40, 30)
+        boardPanel.BorderStyle = BorderStyle.FixedSingle
+        AddHandler boardPanel.Paint, AddressOf BoardPanel_Paint
+        AddHandler boardPanel.MouseClick, AddressOf BoardPanel_MouseClick
+        pnlGame.Controls.Add(boardPanel)
+        RecomputeAnimalCenters()
+
+        lblRoundInfo = New Label()
+        lblRoundInfo.Location = New Point(20, boardTopY + BOARD_H + 10) : lblRoundInfo.AutoSize = True
+        lblRoundInfo.ForeColor = Color.White
+        lblRoundInfo.Font = New Font("Segoe UI", 10.0!, FontStyle.Bold)
+        lblRoundInfo.Text = "Chờ Host bắt đầu ván mới..."
+        pnlGame.Controls.Add(lblRoundInfo)
+
+        lblCountdown = New Label()
+        lblCountdown.Location = New Point(20, boardTopY + BOARD_H + 35) : lblCountdown.AutoSize = True
+        lblCountdown.ForeColor = Color.Gold
+        lblCountdown.Font = New Font("Segoe UI", 10.0!)
+        pnlGame.Controls.Add(lblCountdown)
+
+        Dim lblBetCap As New Label()
+        lblBetCap.Text = "Điểm cược (" & Game777Game.MIN_BET.ToString() & "-" & Game777Game.MAX_BET.ToString() & "):"
+        lblBetCap.AutoSize = True
+        lblBetCap.ForeColor = Color.White
+        lblBetCap.Font = New Font("Segoe UI", 9.5!, FontStyle.Bold)
+        lblBetCap.Location = New Point(20, boardTopY + BOARD_H + 72)
+        pnlGame.Controls.Add(lblBetCap)
+
+        nudBet = New NumericUpDown()
+        nudBet.Location = New Point(175, boardTopY + BOARD_H + 66)
+        nudBet.Size = New Size(80, 26)
+        nudBet.Font = New Font("Segoe UI", 10.0!, FontStyle.Bold)
+        nudBet.BackColor = Color.White
+        nudBet.ForeColor = Color.Black
+        nudBet.BorderStyle = BorderStyle.FixedSingle
+        nudBet.TextAlign = HorizontalAlignment.Center
+        nudBet.Minimum = CDec(Game777Game.MIN_BET)
+        nudBet.Maximum = CDec(Game777Game.MAX_BET)
+        nudBet.Increment = 10
+        nudBet.Value = CDec(Game777Game.MIN_BET)
+        nudBet.Enabled = False
+        pnlGame.Controls.Add(nudBet)
+
+        btnLockBet = New Button()
+        btnLockBet.Text = "Khoá cược"
+        btnLockBet.Location = New Point(270, boardTopY + BOARD_H + 64) : btnLockBet.Size = New Size(120, 30)
+        btnLockBet.Font = New Font("Segoe UI", 9.5!, FontStyle.Bold)
+        btnLockBet.FlatStyle = FlatStyle.Flat
+        btnLockBet.FlatAppearance.BorderSize = 0
+        btnLockBet.BackColor = Color.FromArgb(46, 160, 67)
+        btnLockBet.ForeColor = Color.White
+        btnLockBet.Enabled = False
+        AddHandler btnLockBet.Click, AddressOf BtnLockBet_Click
+        pnlGame.Controls.Add(btnLockBet)
+
+        btnHostAction = New Button()
+        btnHostAction.Text = "Bắt đầu ván mới"
+        btnHostAction.Location = New Point(405, boardTopY + BOARD_H + 64) : btnHostAction.Size = New Size(160, 30)
+        btnHostAction.Font = New Font("Segoe UI", 9.5!, FontStyle.Bold)
+        btnHostAction.FlatStyle = FlatStyle.Flat
+        btnHostAction.FlatAppearance.BorderSize = 0
+        btnHostAction.BackColor = Color.FromArgb(41, 121, 255)
+        btnHostAction.ForeColor = Color.White
+        btnHostAction.Visible = isHost
+        AddHandler btnHostAction.Click, AddressOf BtnHostAction_Click
+        pnlGame.Controls.Add(btnHostAction)
+
+        ' Khung nhat ky: cac bieu tuong (hoac No Hu) da ra trong nhung van gan day, kem icon nho.
+        Dim lblHistoryTitle As New Label()
+        lblHistoryTitle.Text = "Nhật ký kết quả (gần đây nhất ô bên trái):"
+        lblHistoryTitle.AutoSize = True
+        lblHistoryTitle.ForeColor = Color.White
+        lblHistoryTitle.Font = New Font("Segoe UI", 9.0!, FontStyle.Bold)
+        lblHistoryTitle.Location = New Point(20, boardTopY + BOARD_H + 104)
+        pnlGame.Controls.Add(lblHistoryTitle)
+
+        pnlHistory = New Panel()
+        pnlHistory.Location = New Point(20, boardTopY + BOARD_H + 126)
+        pnlHistory.Size = New Size(BOARD_W, 78)
+        pnlHistory.BackColor = Color.FromArgb(12, 16, 20)
+        pnlHistory.BorderStyle = BorderStyle.FixedSingle
+        pnlHistory.AutoScroll = True
+        AddHandler pnlHistory.Paint, AddressOf HistoryPanel_Paint
+        pnlGame.Controls.Add(pnlHistory)
+        RefreshHistoryPanel()
+
+        Dim sideX As Integer = BOARD_W + 40
+        Dim p As Integer
+        For p = 0 To 3
+            pnlPlayers(p) = BuildPlayerCard(p, New Point(sideX, 20 + p * 80), 300)
+            pnlGame.Controls.Add(pnlPlayers(p))
+            If isHost AndAlso p <> 0 Then AttachTopUpMenu(pnlPlayers(p), p)
+        Next p
+
+        If isHost Then
+            Dim lblTopUpHint As New Label()
+            lblTopUpHint.Text = "Mẹo: bấm CHUỘT PHẢI vào thẻ 1 người chơi để nạp hoặc trừ điểm cho họ (đổi ngược với điểm của Host)."
+            lblTopUpHint.AutoSize = True
+            lblTopUpHint.ForeColor = Color.LightGray
+            lblTopUpHint.Font = New Font("Segoe UI", 7.5!, FontStyle.Italic)
+            lblTopUpHint.MaximumSize = New Size(300, 0)
+            lblTopUpHint.Location = New Point(sideX, 20 + 4 * 80 + 2)
+            pnlGame.Controls.Add(lblTopUpHint)
+        End If
+
+        BuildChatPanel(sideX, 300, 20 + 4 * 80 + 36, 700 - (20 + 4 * 80 + 36) - 20)
+
+        Me.Controls.Add(pnlGame)
+        RefreshPlayerCards()
+    End Sub
+
+    Private Function BuildPlayerCard(player As Integer, loc As Point, w As Integer) As Panel
+        Dim card As New Panel()
+        card.Location = loc : card.Size = New Size(w, 80)
+        card.BackColor = Color.White
+        card.BorderStyle = BorderStyle.FixedSingle
+
+        Dim bar As New Panel()
+        bar.Location = New Point(0, 0) : bar.Size = New Size(6, 80)
+        bar.BackColor = PlayerColor(player)
+        card.Controls.Add(bar)
+
+        Dim lblTitle As New Label()
+        lblTitle.Name = "title"
+        lblTitle.Font = New Font("Segoe UI", 9.5!, FontStyle.Bold)
+        lblTitle.ForeColor = PlayerColor(player)
+        lblTitle.Location = New Point(16, 4) : lblTitle.AutoSize = True
+        card.Controls.Add(lblTitle)
+
+        lblCardStatus(player) = New Label()
+        lblCardStatus(player).Font = New Font("Segoe UI", 9.0!)
+        lblCardStatus(player).ForeColor = Color.DimGray
+        lblCardStatus(player).Location = New Point(16, 22) : lblCardStatus(player).AutoSize = True
+        card.Controls.Add(lblCardStatus(player))
+
+        lblCardStats(player) = New Label()
+        lblCardStats(player).Font = New Font("Segoe UI", 8.0!, FontStyle.Bold)
+        lblCardStats(player).ForeColor = Color.FromArgb(133, 77, 14)      ' nau dam - de doc
+        lblCardStats(player).BackColor = Color.FromArgb(255, 236, 179)   ' vang nhat - noi bat lam badge
+        lblCardStats(player).Padding = New Padding(6, 2, 6, 2)
+        lblCardStats(player).Location = New Point(16, 38) : lblCardStats(player).AutoSize = True
+        lblCardStats(player).Visible = False
+        card.Controls.Add(lblCardStats(player))
+
+        lblCardResult(player) = New Label()
+        lblCardResult(player).Font = New Font("Segoe UI", 8.5!, FontStyle.Bold)
+        lblCardResult(player).ForeColor = Color.Gray
+        lblCardResult(player).Text = ""
+        lblCardResult(player).Location = New Point(16, 60) : lblCardResult(player).AutoSize = True
+        card.Controls.Add(lblCardResult(player))
+
+        Return card
+    End Function
+
+    ''' <summary>Cap nhat hien thi quy Jackpot (dung chung Host/Client) - gio nam o banner rieng phia tren vong quay.</summary>
+    Private Sub UpdateJackpotLabel()
+        If pnlJackpotBanner IsNot Nothing Then
+            pnlJackpotBanner.Invalidate()
+        End If
+    End Sub
+
+    ''' <summary>Ve banner Quy Jackpot: icon o No Hu (sprite hoac fallback hinh tron do) + so diem hien co.
+    ''' Dat rieng ben tren vong quay de khong con de len hang bieu tuong dau tien nhu truoc.</summary>
+    Private Sub JackpotBanner_Paint(sender As Object, e As PaintEventArgs)
+        Dim g As Graphics = e.Graphics
+        g.SmoothingMode = SmoothingMode.AntiAlias
+        Dim rect As New Rectangle(0, 0, pnlJackpotBanner.Width - 1, pnlJackpotBanner.Height - 1)
+
+        Using bg As New SolidBrush(Color.FromArgb(35, 24, 10))
+            g.FillRectangle(bg, rect)
+        End Using
+        Using borderPen As New Pen(Color.FromArgb(210, 170, 60), 2)
+            g.DrawRectangle(borderPen, rect)
+        End Using
+
+        Dim iconR As Single = (pnlJackpotBanner.Height - 10) / 2.0F
+        Dim iconC As New PointF(iconR + 6, pnlJackpotBanner.Height / 2.0F)
+        If jackpotSlotImage IsNot Nothing Then
+            DrawSpriteCircular(g, jackpotSlotImage, iconC, iconR, Color.FromArgb(255, 210, 60), 2)
+        Else
+            Using body As New SolidBrush(Color.FromArgb(200, 30, 30))
+                g.FillEllipse(body, iconC.X - iconR, iconC.Y - iconR, iconR * 2, iconR * 2)
+            End Using
+            Using ring As New Pen(Color.FromArgb(255, 210, 60), 2)
+                g.DrawEllipse(ring, iconC.X - iconR, iconC.Y - iconR, iconR * 2, iconR * 2)
+            End Using
+            DrawCenteredString(g, "HŨ", iconC, New Font("Segoe UI", 7.5!, FontStyle.Bold), Color.Gold)
+        End If
+
+        Dim textX As Single = iconC.X + iconR + 10
+        Dim jackpotText As String = "Quỹ Jackpot: " & currentJackpotPool.ToString() & " điểm"
+        Dim jackpotFont As New Font("Segoe UI", 10.0!, FontStyle.Bold)
+        Using textBrush As New SolidBrush(Color.Gold)
+            g.DrawString(jackpotText, jackpotFont, textBrush, textX, pnlJackpotBanner.Height / 2.0F - 9)
+        End Using
+    End Sub
+
+    ''' <summary>Gan context menu (bam chuot phai) vao 1 the nguoi choi, chi danh cho Host, de Host
+    ''' co the nap/tru diem cho nguoi choi do bat cu luc nao (vd: sua lai neu lo nap sai). Gan ca cho
+    ''' cac control con ben trong the (title, status...) de bam chuot phai o dau trong the cung mo duoc menu.</summary>
+    Private Sub AttachTopUpMenu(card As Panel, player As Integer)
+        Dim cms As New ContextMenuStrip()
+
+        Dim itemAdd As New ToolStripMenuItem("Nạp điểm cho người chơi này...")
+        AddHandler itemAdd.Click, Sub(s As Object, e As EventArgs) AdjustPlayerScore(player, True)
+        cms.Items.Add(itemAdd)
+
+        Dim itemSub As New ToolStripMenuItem("Trừ điểm của người chơi này...")
+        AddHandler itemSub.Click, Sub(s As Object, e As EventArgs) AdjustPlayerScore(player, False)
+        cms.Items.Add(itemSub)
+
+        card.ContextMenuStrip = cms
+        Dim ctrl As Control
+        For Each ctrl In card.Controls
+            ctrl.ContextMenuStrip = cms
+        Next ctrl
+    End Sub
+
+    ''' <summary>Chi Host goi: nap them diem cho 1 nguoi choi (tru tu diem Host) hoac tru bot diem
+    ''' cua nguoi choi do (cong lai cho Host) - dung de sua lai neu lo nap/tru sai. isTopUp = True la
+    ''' nap (Host -> nguoi choi), False la tru (nguoi choi -> Host). Sau khi doi, dong bo diem moi
+    ''' cho tat ca nguoi choi qua mang.</summary>
+    Private Sub AdjustPlayerScore(seat As Integer, isTopUp As Boolean)
+        If Not isHost Then Return
+        If seat = 0 Then Return ' khong nap/tru cho chinh Host
+
+        If Not playerConnected(seat) Then
+            MessageBox.Show("Player " & (seat + 1).ToString() & " hiện chưa có ai, không thể chỉnh điểm.")
+            Return
+        End If
+
+        Dim actionLabel As String = If(isTopUp, "nạp cho", "trừ của")
+        Dim promptMsg As String = "Nhập số điểm muốn " & actionLabel & " Player " & (seat + 1).ToString() & " (" & playerNames(seat) & ")." & vbCrLf &
+            If(isTopUp, "Số điểm này sẽ được TRỪ trực tiếp từ điểm của bạn (Host).", "Số điểm này sẽ được CỘNG trực tiếp vào điểm của bạn (Host).")
+        Dim dialogTitle As String = If(isTopUp, "Nạp điểm cho người chơi", "Trừ điểm của người chơi")
+        Dim raw As String = InputBox(promptMsg, dialogTitle, "50")
+        If raw Is Nothing OrElse raw.Trim() = "" Then Return ' nguoi dung bam Cancel hoac de trong
+
+        Dim amount As Long
+        If Not Long.TryParse(raw.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, amount) Then
+            MessageBox.Show("Số điểm không hợp lệ.")
+            Return
+        End If
+        If amount <= 0 Then
+            MessageBox.Show("Số điểm phải lớn hơn 0.")
+            Return
+        End If
+
+        Dim hostScore As Long = 0
+        If scoresBySeat.ContainsKey(0) Then hostScore = scoresBySeat(0)
+        Dim targetScore As Long = 0
+        If scoresBySeat.ContainsKey(seat) Then targetScore = scoresBySeat(seat)
+
+        Dim sysMsg As String
+        If isTopUp Then
+            If amount > hostScore Then
+                MessageBox.Show("Bạn không đủ điểm để nạp (bạn đang có " & hostScore.ToString() & " điểm).")
+                Return
+            End If
+            scoresBySeat(0) = hostScore - amount
+            scoresBySeat(seat) = targetScore + amount
+            sysMsg = "Host đã nạp " & amount.ToString() & " điểm cho Player " & (seat + 1).ToString() & " (" & playerNames(seat) & ")."
+        Else
+            If amount > targetScore Then
+                MessageBox.Show("Player " & (seat + 1).ToString() & " không đủ điểm để trừ (hiện có " & targetScore.ToString() & " điểm).")
+                Return
+            End If
+            scoresBySeat(seat) = targetScore - amount
+            scoresBySeat(0) = hostScore + amount
+            sysMsg = "Host đã trừ " & amount.ToString() & " điểm của Player " & (seat + 1).ToString() & " (" & playerNames(seat) & ")."
+        End If
+
+        AppendChat("Hệ thống: " & sysMsg)
+        hub.Broadcast("CHAT:Hệ thống:" & sysMsg)
+
+        BroadcastScores()
+        RefreshPlayerCards()
+    End Sub
+
+    Private Sub RefreshPlayerCards()
+        Dim p As Integer
+        For p = 0 To 3
+            If pnlPlayers(p) Is Nothing Then Continue For
+            Dim titleLbl As Label = CType(pnlPlayers(p).Controls("title"), Label)
+            Dim suffix As String = ""
+            If p = localSeat Then suffix = " (Bạn)"
+            titleLbl.Text = "Player " & (p + 1).ToString() & " - " & playerNames(p) & suffix
+
+            If p = 0 OrElse playerConnected(p) Then
+                lblCardStatus(p).Text = "Điểm: " & scoresBySeat(p).ToString()
+            Else
+                lblCardStatus(p).Text = "(trống)"
+            End If
+
+            If lockedSymbolBySeat(p) >= 0 Then
+                If lockedSymbolBySeat(p) = Game777Game.JACKPOT_INDEX Then
+                    lblCardStats(p).Text = "ĐÃ KHOÁ: NỔ HŨ  (" & lockedAmountBySeat(p).ToString() & " điểm)"
+                Else
+                    Dim a As Game777Game.SymbolInfo = Game777Game.Symbols(lockedSymbolBySeat(p))
+                    lblCardStats(p).Text = "ĐÃ KHOÁ: " & a.Name & " x" & a.Multiplier.ToString() &
+                                            "  (" & lockedAmountBySeat(p).ToString() & " điểm)"
+                End If
+                lblCardStats(p).Visible = True
+            Else
+                lblCardStats(p).Text = ""
+                lblCardStats(p).Visible = False
+            End If
+
+            If lastRoundHasResult(p) Then
+                If lastRoundWonBySeat(p) Then
+                    lblCardResult(p).Text = "Vừa rồi: Thắng +" & lastRoundPayoutBySeat(p).ToString() & " điểm"
+                    lblCardResult(p).ForeColor = Color.FromArgb(30, 140, 40)
+                    pnlPlayers(p).BackColor = Color.FromArgb(224, 250, 224)
+                Else
+                    lblCardResult(p).Text = "Vừa rồi : Thua " & Math.Abs(lastRoundPayoutBySeat(p)).ToString() & " điểm"
+                    lblCardResult(p).ForeColor = Color.FromArgb(190, 40, 40)
+                    pnlPlayers(p).BackColor = Color.FromArgb(255, 226, 226)
+                End If
+            Else
+                lblCardResult(p).Text = ""
+                pnlPlayers(p).BackColor = Color.White
+            End If
+        Next p
+    End Sub
+
+    ' ============================================================
+    '  NHAT KY KET QUA (bieu tuong / No Hu da ra trong nhung van gan day)
+    ' ============================================================
+
+    ''' <summary>Them 1 ket qua moi vao dau nhat ky (van gan nhat luon nam ben trai), cat bot
+    ''' neu vuot qua HISTORY_MAX van gan nhat.</summary>
+    Private Sub AddHistoryEntry(resultIndex As Integer)
+        spinHistory.Insert(0, resultIndex)
+        Do While spinHistory.Count > HISTORY_MAX
+            spinHistory.RemoveAt(spinHistory.Count - 1)
+        Loop
+        RefreshHistoryPanel()
+    End Sub
+
+    ''' <summary>Cap nhat kich thuoc noi dung cuon ngang cua khung nhat ky va ve lai.</summary>
+    Private Sub RefreshHistoryPanel()
+        If pnlHistory Is Nothing Then Return
+        Const itemW As Integer = 50
+        Dim contentW As Integer = Math.Max(pnlHistory.ClientSize.Width, spinHistory.Count * itemW + 10)
+        pnlHistory.AutoScrollMinSize = New Size(contentW, 0)
+        pnlHistory.Invalidate()
+    End Sub
+
+    ''' <summary>Ve tung o nhat ky: icon tron nho (sprite bieu tuong/No Hu tu Assets, fallback mau + ten neu thieu anh)
+    ''' kem he so nhan (hoac "HU") ben duoi. Van gan nhat nam ben trai nhat.</summary>
+    Private Sub HistoryPanel_Paint(sender As Object, e As PaintEventArgs)
+        Dim g As Graphics = e.Graphics
+        g.SmoothingMode = SmoothingMode.AntiAlias
+        If spinHistory.Count = 0 Then
+            Using dim_ As New SolidBrush(Color.DimGray)
+                g.DrawString("Chưa có kết quả nào.", New Font("Segoe UI", 9.0!, FontStyle.Italic), dim_, 10, pnlHistory.ClientSize.Height / 2.0F - 8)
+            End Using
+            Return
+        End If
+
+        Const itemW As Integer = 50
+        Const r As Single = 17
+        Dim offsetX As Integer = pnlHistory.AutoScrollPosition.X
+        Dim cy As Single = pnlHistory.ClientSize.Height / 2.0F - 6
+
+        Dim i As Integer
+        For i = 0 To spinHistory.Count - 1
+            Dim idx As Integer = spinHistory(i)
+            Dim cx As Single = offsetX + 10 + i * itemW + r
+            Dim c As New PointF(cx, cy)
+
+            If idx = Game777Game.JACKPOT_INDEX Then
+                If jackpotSlotImage IsNot Nothing Then
+                    DrawSpriteCircular(g, jackpotSlotImage, c, r, Color.FromArgb(255, 210, 60), 2)
+                Else
+                    Using body As New SolidBrush(Color.FromArgb(200, 30, 30))
+                        g.FillEllipse(body, c.X - r, c.Y - r, r * 2, r * 2)
+                    End Using
+                    Using ring As New Pen(Color.FromArgb(255, 210, 60), 2)
+                        g.DrawEllipse(ring, c.X - r, c.Y - r, r * 2, r * 2)
+                    End Using
+                    DrawCenteredString(g, "HŨ", c, New Font("Segoe UI", 7.0!, FontStyle.Bold), Color.Gold)
+                End If
+                DrawCenteredString(g, "Nổ Hũ", New PointF(c.X, c.Y + r + 9), New Font("Segoe UI", 6.5!, FontStyle.Bold), Color.Yellow)
+            Else
+                Dim a As Game777Game.SymbolInfo = Game777Game.Symbols(idx)
+                If symbolImages(idx) IsNot Nothing Then
+                    DrawSpriteCircular(g, symbolImages(idx), c, r, Color.FromArgb(90, 90, 90), 1)
+                Else
+                    Using body As New SolidBrush(a.BodyColor)
+                        g.FillEllipse(body, c.X - r, c.Y - r, r * 2, r * 2)
+                    End Using
+                    Using ring As New Pen(Color.FromArgb(90, 90, 90), 1)
+                        g.DrawEllipse(ring, c.X - r, c.Y - r, r * 2, r * 2)
+                    End Using
+                End If
+                DrawCenteredString(g, "x" & a.Multiplier.ToString(), New PointF(c.X, c.Y + r + 9), New Font("Segoe UI", 6.5!, FontStyle.Bold), Color.Yellow)
+            End If
+        Next i
+    End Sub
+
+    ' ============================================================
+    '  VE VONG QUAY
+    ' ============================================================
+    Private Sub RecomputeAnimalCenters()
+        boardRect = New Rectangle(60, 36, BOARD_W - 120, BOARD_H - 90)
+        Dim n As Integer = Game777Game.TOTAL_SLOTS ' 12 bieu tuong + 1 o No Hu, chia deu quanh vien
+        Dim i As Integer
+        For i = 0 To n - 1
+            Dim t As Double = (i + 0.5) / n
+            symbolCenters(i) = PerimeterPoint(t, boardRect)
+        Next i
+    End Sub
+
+    ''' <summary>Tra ve 1 diem tren vien hinh chu nhat, di theo chieu kim dong ho bat dau tu
+    ''' goc tren-trai, voi t trong doan [0,1) la ty le quang duong da di so voi chu vi.</summary>
+    Private Function PerimeterPoint(t As Double, rect As Rectangle) As PointF
+        Dim w As Double = rect.Width
+        Dim h As Double = rect.Height
+        Dim perim As Double = 2.0 * (w + h)
+        Dim dist As Double = t * perim
+
+        If dist <= w Then
+            Return New PointF(CSng(rect.Left + dist), CSng(rect.Top))
+        End If
+        dist -= w
+        If dist <= h Then
+            Return New PointF(CSng(rect.Right), CSng(rect.Top + dist))
+        End If
+        dist -= h
+        If dist <= w Then
+            Return New PointF(CSng(rect.Right - dist), CSng(rect.Bottom))
+        End If
+        dist -= w
+        Return New PointF(CSng(rect.Left), CSng(rect.Bottom - dist))
+    End Function
+
+    Private Sub BoardPanel_Paint(sender As Object, e As PaintEventArgs)
+        Dim g As Graphics = e.Graphics
+        g.SmoothingMode = SmoothingMode.AntiAlias
+        g.Clear(Color.FromArgb(10, 40, 30))
+
+        Using framePen As New Pen(Color.FromArgb(200, 170, 60), 3)
+            g.DrawRectangle(framePen, boardRect)
+        End Using
+
+        Dim centerPt As New PointF(boardPanel.Width / 2.0F, boardPanel.Height / 2.0F)
+
+        ' Tia sang toi bieu tuong dang sang (khi dang quay hoac vua dung)
+        If highlightIndex >= 0 Then
+            Using beamPen As New Pen(Color.FromArgb(150, 255, 230, 80), 3)
+                g.DrawLine(beamPen, centerPt, symbolCenters(highlightIndex))
+            End Using
+        End If
+
+        ' "Dau rong" o giua - dung sprite neu co, khong thi fallback ve tay
+        Dim dr As Single = 30
+        If logoImage IsNot Nothing Then
+            DrawSpriteCircular(g, logoImage, centerPt, dr, Color.FromArgb(255, 220, 130), 2)
+        Else
+            Using logoBrush As New SolidBrush(Color.FromArgb(220, 170, 40))
+                g.FillEllipse(logoBrush, centerPt.X - dr, centerPt.Y - dr, dr * 2, dr * 2)
+            End Using
+            Using logoPen As New Pen(Color.FromArgb(255, 220, 130), 2)
+                g.DrawEllipse(logoPen, centerPt.X - dr, centerPt.Y - dr, dr * 2, dr * 2)
+            End Using
+            DrawCenteredString(g, "777", centerPt, New Font("Segoe UI", 8.0!, FontStyle.Bold), Color.White)
+        End If
+
+        ' 12 bieu tuong
+        Dim i As Integer
+        For i = 0 To Game777Game.SYMBOL_COUNT - 1
+            Dim a As Game777Game.SymbolInfo = Game777Game.Symbols(i)
+            Dim c As PointF = symbolCenters(i)
+
+            Dim r As Single = CELL_RADIUS
+            If i = highlightIndex Then r = CELL_RADIUS + 4
+
+            Dim ringColor As Color
+            Dim ringWidth As Integer
+            If i = highlightIndex Then
+                ringColor = Color.Gold : ringWidth = 3
+            ElseIf i = selectedSymbolIndex Then
+                ringColor = PlayerColor(Math.Max(localSeat, 0)) : ringWidth = 3
+            ElseIf i = lastResultIndex AndAlso state = RoundState.ShowingResult Then
+                ringColor = Color.LimeGreen : ringWidth = 3
+            Else
+                ringColor = Color.White : ringWidth = 1
+            End If
+
+            If symbolImages(i) IsNot Nothing Then
+                DrawSpriteCircular(g, symbolImages(i), c, r, ringColor, ringWidth)
+            Else
+                Using body As New SolidBrush(a.BodyColor)
+                    g.FillEllipse(body, c.X - r, c.Y - r, r * 2, r * 2)
+                End Using
+                Using borderPen As New Pen(ringColor, ringWidth)
+                    g.DrawEllipse(borderPen, c.X - r, c.Y - r, r * 2, r * 2)
+                End Using
+                DrawCenteredString(g, a.Name, New PointF(c.X, c.Y - 4), New Font("Segoe UI", 7.0!, FontStyle.Bold), Color.White)
+            End If
+
+            DrawCenteredString(g, "x" & a.Multiplier.ToString(), New PointF(c.X, c.Y + r + 9), New Font("Segoe UI", 7.5!, FontStyle.Bold), Color.Yellow)
+
+            ' Cham mau nho danh dau seat nao da khoa cuoc vao con nay
+            Dim seatIdx As Integer
+            Dim markOffset As Integer = 0
+            For seatIdx = 0 To 3
+                If lockedSymbolBySeat(seatIdx) = i Then
+                    Using markBrush As New SolidBrush(PlayerColor(seatIdx))
+                        g.FillEllipse(markBrush, c.X - r + markOffset, c.Y - r - 2, 8, 8)
+                    End Using
+                    markOffset += 10
+                End If
+            Next seatIdx
+        Next i
+
+        ' O "No Hu" (Jackpot) - o thu 13, ngoai 12 bieu tuong
+        Dim jIdx As Integer = Game777Game.JACKPOT_INDEX
+        Dim jc As PointF = symbolCenters(jIdx)
+        Dim jr As Single = CELL_RADIUS
+        If jIdx = highlightIndex Then jr = CELL_RADIUS + 4
+
+        Dim jRingColor As Color
+        Dim jRingWidth As Integer
+        If jIdx = highlightIndex Then
+            jRingColor = Color.Gold : jRingWidth = 3
+        ElseIf jIdx = selectedSymbolIndex Then
+            jRingColor = PlayerColor(Math.Max(localSeat, 0)) : jRingWidth = 3
+        ElseIf jIdx = lastResultIndex AndAlso state = RoundState.ShowingResult Then
+            jRingColor = Color.LimeGreen : jRingWidth = 3
+        Else
+            jRingColor = Color.FromArgb(255, 210, 60) : jRingWidth = 2
+        End If
+
+        If jackpotSlotImage IsNot Nothing Then
+            DrawSpriteCircular(g, jackpotSlotImage, jc, jr, jRingColor, jRingWidth)
+        Else
+            Using jBody As New SolidBrush(Color.FromArgb(200, 30, 30))
+                g.FillEllipse(jBody, jc.X - jr, jc.Y - jr, jr * 2, jr * 2)
+            End Using
+            Using jBorderPen As New Pen(jRingColor, jRingWidth)
+                g.DrawEllipse(jBorderPen, jc.X - jr, jc.Y - jr, jr * 2, jr * 2)
+            End Using
+            DrawCenteredString(g, "HŨ", New PointF(jc.X, jc.Y - 4), New Font("Segoe UI", 7.5!, FontStyle.Bold), Color.Gold)
+        End If
+        DrawCenteredString(g, currentJackpotPool.ToString(), New PointF(jc.X, jc.Y + jr + 9), New Font("Segoe UI", 7.0!, FontStyle.Bold), Color.Yellow)
+
+        Dim jSeatIdx As Integer
+        Dim jMarkOffset As Integer = 0
+        For jSeatIdx = 0 To 3
+            If lockedSymbolBySeat(jSeatIdx) = jIdx Then
+                Using jMarkBrush As New SolidBrush(PlayerColor(jSeatIdx))
+                    g.FillEllipse(jMarkBrush, jc.X - jr + jMarkOffset, jc.Y - jr - 2, 8, 8)
+                End Using
+                jMarkOffset += 10
+            End If
+        Next jSeatIdx
+
+        ' Hieu ung "no hu": tia sang / sprite toa ra tam thoi tu o No Hu khi vong quay vua dung trung o nay
+        If jackpotCelebrateActive Then
+            DrawJackpotBurst(g, jc, jr)
+        End If
+    End Sub
+
+    ''' <summary>Ve hieu ung "no hu" tai vi tri o No Hu: dung sprite Assets\nohu_hieuung.png neu co (phong to/mo dan),
+    ''' fallback tu ve cac tia sang vang toa tron bang GDI+ neu khong co sprite.</summary>
+    Private Sub DrawJackpotBurst(g As Graphics, center As PointF, baseR As Single)
+        If jackpotBurstImage IsNot Nothing Then
+            Dim scale As Single = 1.4F + 0.5F * CSng(Math.Sin(jackpotCelebrateFrame * 0.4))
+            Dim br As Single = baseR * scale
+            g.DrawImage(jackpotBurstImage, center.X - br, center.Y - br, br * 2, br * 2)
+        Else
+            Const rays As Integer = 12
+            Dim pulse As Single = baseR * (1.6F + 0.4F * CSng(Math.Sin(jackpotCelebrateFrame * 0.5)))
+            Using rayPen As New Pen(Color.FromArgb(220, 255, 215, 60), 3)
+                Dim k As Integer
+                For k = 0 To rays - 1
+                    Dim ang As Double = (2.0 * Math.PI / rays) * k + jackpotCelebrateFrame * 0.15
+                    Dim x2 As Single = center.X + CSng(Math.Cos(ang) * pulse)
+                    Dim y2 As Single = center.Y + CSng(Math.Sin(ang) * pulse)
+                    g.DrawLine(rayPen, center, New PointF(x2, y2))
+                Next k
+            End Using
+        End If
+    End Sub
+
+    ''' <summary>Bat dau hieu ung an mung "no hu" tren vong quay trong vai giay (chi hieu ung hinh anh,
+    ''' khong lien quan tinh diem - tinh diem da xu ly rieng trong ComputePayouts/ApplyResult).</summary>
+    Private Sub StartJackpotCelebration()
+        jackpotCelebrateActive = True
+        jackpotCelebrateFrame = 0
+        If jackpotCelebrateTimer Is Nothing Then
+            jackpotCelebrateTimer = New Timer()
+            jackpotCelebrateTimer.Interval = 60
+            AddHandler jackpotCelebrateTimer.Tick, AddressOf JackpotCelebrateTimer_Tick
+        End If
+        jackpotCelebrateTimer.Start()
+    End Sub
+
+    Private Sub JackpotCelebrateTimer_Tick(sender As Object, e As EventArgs)
+        jackpotCelebrateFrame += 1
+        If boardPanel IsNot Nothing Then boardPanel.Invalidate()
+        If jackpotCelebrateFrame >= 30 Then
+            jackpotCelebrateTimer.Stop()
+            jackpotCelebrateActive = False
+            If boardPanel IsNot Nothing Then boardPanel.Invalidate()
+        End If
+    End Sub
+
+    ''' <summary>Ve 1 anh sprite duoc cat tron (clip hinh tron) tam c, ban kinh r, kem vien mau ringColor.
+    ''' Dung chung cho ca 12 bieu tuong va logo 777.</summary>
+    Private Sub DrawSpriteCircular(g As Graphics, img As Image, c As PointF, r As Single, ringColor As Color, ringWidth As Integer)
+        Dim rectF As New RectangleF(c.X - r, c.Y - r, r * 2, r * 2)
+        Dim path As New GraphicsPath()
+        path.AddEllipse(rectF)
+        Dim oldClip As Region = g.Clip
+        g.SetClip(path, CombineMode.Intersect)
+        g.DrawImage(img, rectF.X, rectF.Y, rectF.Width, rectF.Height)
+        g.Clip = oldClip
+        path.Dispose()
+        Using borderPen As New Pen(ringColor, ringWidth)
+            g.DrawEllipse(borderPen, rectF)
+        End Using
+    End Sub
+
+    Private Sub DrawCenteredString(g As Graphics, text As String, center As PointF, font As Font, color As Color)
+        Dim sz As SizeF = g.MeasureString(text, font)
+        Using b As New SolidBrush(color)
+            g.DrawString(text, font, b, center.X - sz.Width / 2.0F, center.Y - sz.Height / 2.0F)
+        End Using
+    End Sub
+
+    ''' <summary>Hien gop y mau cam tam thoi khi nguoi choi bam vao vong quay nhung chua den luot
+    ''' dat cuoc (vi du: Host chua bam "Bat dau van moi"), de tranh cam giac ung dung bi "cung do".</summary>
+    Private Sub ShowRoundHint()
+        Dim msg As String
+        If state = RoundState.Idle AndAlso isHost Then
+            msg = ">> Bạn cần bấm nút ""Bắt đầu ván mới"" trước khi chọn biểu tượng!"
+        ElseIf state = RoundState.Idle Then
+            msg = ">> Đang chờ Host bấm ""Bắt đầu ván mới""..."
+        ElseIf state = RoundState.Spinning Then
+            msg = ">> Đang quay, vui lòng đợi kết quả..."
+        ElseIf hasLockedThisRound Then
+            msg = ">> Bạn đã khoá cược ván này rồi, đợi kết quả nhé."
+        Else
+            msg = ">> Chưa thể chọn lúc này."
+        End If
+
+        lblRoundInfo.Text = msg
+        lblRoundInfo.ForeColor = Color.Orange
+
+        If hintTimer Is Nothing Then
+            hintTimer = New Timer()
+            hintTimer.Interval = 1500
+            AddHandler hintTimer.Tick, AddressOf HintTimer_Tick
+        End If
+        hintTimer.Stop()
+        hintTimer.Start()
+    End Sub
+
+    ''' <summary>Sau khi het thoi gian hien gop y, tra lblRoundInfo ve mau/noi dung dung voi trang thai hien tai.</summary>
+    Private Sub HintTimer_Tick(sender As Object, e As EventArgs)
+        hintTimer.Stop()
+        lblRoundInfo.ForeColor = Color.White
+        Select Case state
+            Case RoundState.Idle
+                lblRoundInfo.Text = "Chờ Host bắt đầu ván mới..."
+            Case RoundState.Betting
+                lblRoundInfo.Text = "Ván " & game.CurrentRoundNo.ToString() & " - hãy chọn 1 biểu tượng và khoá cược!"
+            Case RoundState.Spinning
+                lblRoundInfo.Text = "Đang quay..."
+        End Select
+    End Sub
+
+    Private Sub BoardPanel_MouseClick(sender As Object, e As MouseEventArgs)
+        If state <> RoundState.Betting Then
+            ShowRoundHint()
+            Return
+        End If
+        If hasLockedThisRound Then Return
+
+        Dim best As Integer = -1
+        Dim bestDist As Double = Double.MaxValue
+        Dim i As Integer
+        For i = 0 To Game777Game.TOTAL_SLOTS - 1
+            Dim c As PointF = symbolCenters(i)
+            Dim dx As Double = c.X - e.X
+            Dim dy As Double = c.Y - e.Y
+            Dim d As Double = Math.Sqrt(dx * dx + dy * dy)
+            If d < bestDist Then
+                bestDist = d
+                best = i
+            End If
+        Next i
+
+        If best >= 0 AndAlso bestDist <= CELL_RADIUS + 10 Then
+            selectedSymbolIndex = best
+            boardPanel.Invalidate()
+        End If
+    End Sub
+
+    ' ============================================================
+    '  CHAT (giu nguyen giao thuc CHAT:<tag>:<msg> nhu cac project truoc)
+    ' ============================================================
+    Private Sub BuildChatPanel(x As Integer, w As Integer, y As Integer, h As Integer)
+        pnlChat = New Panel()
+        pnlChat.Location = New Point(x, y)
+        pnlChat.Size = New Size(w, h)
+
+        lstChat = New ListBox()
+        lstChat.Location = New Point(0, 0)
+        lstChat.Size = New Size(w, h - 30)
+        pnlChat.Controls.Add(lstChat)
+
+        txtChatInput = New TextBox()
+        txtChatInput.Location = New Point(0, h - 26)
+        txtChatInput.Size = New Size(w - 55, 24)
+        AddHandler txtChatInput.KeyDown, Sub(s As Object, ev As KeyEventArgs)
+            If ev.KeyCode = Keys.Enter Then
+                BtnSend_Click(s, EventArgs.Empty)
+                ev.Handled = True
+                ev.SuppressKeyPress = True
+            End If
+        End Sub
+        pnlChat.Controls.Add(txtChatInput)
+
+        btnSend = New Button()
+        btnSend.Text = "Gửi"
+        btnSend.Location = New Point(w - 50, h - 27)
+        btnSend.Size = New Size(50, 26)
+        AddHandler btnSend.Click, AddressOf BtnSend_Click
+        pnlChat.Controls.Add(btnSend)
+
+        pnlGame.Controls.Add(pnlChat)
+    End Sub
+
+    Private Sub BtnSend_Click(sender As Object, e As EventArgs)
+        If txtChatInput.Text.Trim() = "" Then Return
+        If localSeat < 0 Then Return
+        Dim tag As String = "Player " & (localSeat + 1).ToString()
+        Dim msg As String = txtChatInput.Text.Trim()
+        AppendChat(tag & ": " & msg)
+
+        If isHost Then
+            hub.Broadcast("CHAT:" & tag & ":" & msg)
+        Else
+            If peer IsNot Nothing AndAlso peer.IsConnected Then peer.SendLine("CHAT:" & tag & ":" & msg)
+        End If
+
+        txtChatInput.Text = ""
+        txtChatInput.Focus()
+    End Sub
+
+    Private Sub AppendChat(msg As String)
+        If lstChat Is Nothing Then Return
+        lstChat.Items.Add(msg)
+        lstChat.TopIndex = Math.Max(0, lstChat.Items.Count - 1)
+    End Sub
+
+End Class
